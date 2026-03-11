@@ -1,0 +1,124 @@
+# Import the PET reconstruction engine
+import sirf.STIR as pet
+# Set the verbosity
+pet.set_verbosity(0)
+# Store temporary sinograms in RAM
+pet.AcquisitionData.set_storage_scheme("memory")
+# SIRF STIR message redirector
+import sirf
+
+import sirf.STIR as pet
+msg = sirf.STIR.MessageRedirector(info=None, warn=None, errr=None)
+from ARTE.kernel.LHK import  BuildK, kernelise_image, set_KOSMAPOSL
+from ARTE.architectures.UNet import  UNet
+from ARTE.utils.torch_operations import  add_noise, tdivide
+from ARTE.utils.plots import plot_2_tensors_w_range
+from ARTE.utils.sirf_torch import primal_op as F
+from ARTE.utils.sirf_torch import dual_op as B
+from ARTE.utils.sirf_torch import get_torch_subset
+
+import numpy as np
+import time
+import torch
+from tqdm.notebook import trange, tqdm
+device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+
+from sirf.Utilities import examples_data_path
+sinogram_template = pet.AcquisitionData(examples_data_path('PET')\
+                                        + '/thorax_single_slice/template_sinogram.hs');
+true_brain = pet.ImageData('FDG_tumour_small.hv') #(150x150)
+umap = pet.ImageData('uMap_small.hv')
+T1 = pet.ImageData('T1_small.hv')
+
+true_brain_np = true_brain.as_array()
+true_brain_tt = torch.from_numpy(true_brain_np)# tt torch tensor
+
+# x and y size to in Unet need to be divisible  by 2, 3 times
+true_brain_tt_2d = true_brain_tt[7,2:146,2:146].repeat(1,1,1,1).to(device)
+image_template = sinogram_template.create_uniform_image(1.0,true_brain_tt_2d.shape[2]);
+
+T1_np = T1.as_array()
+T1_tt = torch.from_numpy(T1_np)# tt torch tensor
+T1_tt_2d = T1_tt[7,2:146,2:146].repeat(1,1,1,1).to(device)
+
+umap_np = umap.as_array()
+umap_tt = torch.from_numpy(umap_np)# tt torch tensor
+umap_tt_2d = umap_tt[7,2:146,2:146].repeat(1,1,1,1).to(device)
+umap = image_template.fill(umap_tt_2d[0,...].detach().cpu().numpy())
+
+#%% create acquisition model
+acq_model = pet.AcquisitionModelUsingParallelproj();
+acq_model.set_up(sinogram_template,image_template);
+
+xt  = true_brain_tt_2d
+anat_tt = T1_tt_2d.to(device)/T1_tt_2d.max()
+#make sirf anatomical image
+anat_array=((anat_tt[0,...].detach().cpu().numpy()))
+anat=image_template.clone().fill(anat_array)
+
+num_subsets=8
+num_iter=2
+
+f = F(image_template,sinogram_template,acq_model,num_subsets=num_subsets).to(device)
+b = B(image_template,sinogram_template,acq_model,num_subsets=num_subsets).to(device)
+
+at = torch.ones(xt.shape).repeat(1,1,1,1).to(device)
+y0=f(xt)
+y =  add_noise(y0,torch.Generator(42),10).to(device)
+
+# set up acquisition model
+y_sirf = sinogram_template.fill(y.detach().cpu().numpy())
+obj_fun = pet.make_Poisson_loglikelihood(y_sirf)
+obj_fun.set_acquisition_model(acq_model)
+
+# parameters 
+hybrid=True 
+sigma_m=0.6
+sigma_p=0.7
+w=5
+recon=pet.KOSMAPOSLReconstructor()
+set_KOSMAPOSL(recon, obj_fun, anat_tt, at, hybrid, w,sigma_m,sigma_p, True )
+
+
+num_iter=1
+save_every=10
+
+K=kernelise_image()
+
+def HKEM_iteration( current, y, sinogram_template, num_subsets=1, subset_num=0):
+    if (num_subsets==1):
+        ys=y
+        sens = b(torch.ones(ys.shape)).to(device) 
+        fp=f(current).to(device)
+        grad=b((tdivide(ys,fp)))
+    else:
+        ys = get_torch_subset(y,range(subset_num*num_subsets,subset_num*num_subsets+num_subsets),sinogram_template).to(device)
+        sens = b(torch.ones(ys.shape),subset_num).to(device) 
+        fp=f(current,subset_num).to(device)
+        grad=b((tdivide(ys,fp)),subset_num)
+
+    return tdivide(current,sens)*grad
+
+# Start timer
+start_time = time.time()
+at = torch.ones(xt.shape).repeat(1,1,1,1).to(device)
+
+for it in range(num_iter):
+    for s in range(num_subsets):
+        with torch.no_grad():
+                ati=HKEM_iteration(at,y,sinogram_template,num_subsets,num_iter,s)          
+                at=ati.to(at.device)
+
+l = K.apply(at,at, image_template, recon)
+def save_as_template(tensor, template):
+     tnp=tensor[0,:,:,:].detach().cpu().numpy()
+     template.fill(tnp)
+     template.save('ciao')
+     
+save_as_template(l, image_template)
+# End timer
+end_time = time.time()
+
+# Calculate elapsed time
+elapsed_time = end_time - start_time
+print("Elapsed time: ", elapsed_time)
