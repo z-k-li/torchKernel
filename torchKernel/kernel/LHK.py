@@ -83,7 +83,7 @@ def set_KOSMAPOSL(recon, obj_fun, anatomical, curr_alpha, h, nghb, sm, sp, is2d,
     recon.set_up(sirf_at)   
     
 class BuildK(nn.Module):
-    def __init__(self, sigma_m, is_voxelised, save_mem_k, spacing=None, is_iterative=0, sigma_p=None, sigma_dm=None, isHybrid=False):
+    def __init__(self, sigma_m, is_voxelised, save_mem_k, spacing=None, is_iterative=0, sigma_p=None, sigma_dm=None, isHybrid=False, isDeepK=False):
         super(BuildK, self).__init__()
         self.sigma_m = sigma_m
         self.sigma_p = sigma_p if sigma_p else sigma_m
@@ -93,6 +93,7 @@ class BuildK(nn.Module):
         self.spacing = spacing
         self.is_iterative = is_iterative
         self.isHybrid = isHybrid
+        self.isDeepK=isDeepK
         # STIR uses sigma_m, sigma_p, sigma_dm for anatomical, functional, and distance weighting
         self.ksigma = nn.Parameter(torch.tensor([[[[float(sigma_m)]]]], device=device))
 
@@ -344,7 +345,7 @@ class BuildK(nn.Module):
             Kw, idx = self.get_features(W,ID,ksigma)
             self.Kw=Kw
             self.ID=ID
-
+    
     def get_K(self,W,ID,ksigma):
 
         Kw, idx = self.get_features(W,ID,ksigma)
@@ -371,6 +372,52 @@ class BuildK(nn.Module):
         org_shape=a.shape
         # K=K.to(device)
         return  torch.sparse.mm(K,a.reshape(a.numel(),1)).reshape(org_shape)#torch.mv(K,a.reshape(a.numel())).reshape(org_shape)#.to(torch.float32)
+    
+    def kernelise_image(self, Kw, ID, a):
+        """
+        Apply kernel weights Kw to image a using neighbor indices ID.
+        Equivalent to K * a without creating a sparse matrix.
+        """
+
+        # Flatten image to [num_pixels]
+        flat = a.reshape(-1)                     # [P]
+
+        # Gather neighbor values: shape [P, K]
+        vals = flat[ID.reshape(-1, ID.shape[-1])]
+
+        # Multiply by weights and sum: shape [P]
+        out = (Kw.reshape(-1, Kw.shape[-1]) * vals).sum(dim=1)
+
+        # Reshape back to the original image shape
+        return out.reshape(a.shape)
+    
+    def kernelise_image_t(self, Kw, ID, b):
+        """
+        Compute the adjoint of the kernel operator K^T b without sparse matrices.
+
+        Kw : [P, K]    weights
+        ID : [P, K]    neighbor indices
+        b  : [P]       vector being backprojected
+
+        returns: [P]
+        """
+
+        # 1. Expand b to match Kw (broadcasted j → j,k)
+        #    shape: [P, K]
+        b_expanded = b.unsqueeze(1).expand_as(Kw)
+
+        # 2. Compute contribution for each (j,k)
+        #    contrib[j,k] = Kw[j,k] * b[j]
+        contrib = Kw * b_expanded              # [P, K]
+
+        # 3. Scatter-add to accumulate contributions at ID[j,k]
+        #    adj[i] += contrib[j,k]  where i = ID[j,k]
+        P = Kw.shape[0]
+        adj = torch.zeros(P, device=Kw.device)
+
+        adj = adj.scatter_add(0, ID.reshape(-1), contrib.reshape(-1))
+
+        return adj
     
     #apply kernel to image
     def kernelise_image_save_mem(self,a):
@@ -421,7 +468,34 @@ class BuildK(nn.Module):
         output = output.scatter_add(0, flat_ID, flat_values)
 
         return output.reshape(org_shape)
- 
+    
+    def deepK_forward(self, net_W, k,w, functional_input=None):
+        ID,nN,distances = self.extract_neighbour_indices(input.shape,w)
+        dim1,dim2,dim3 = net_W.shape[1], net_W.shape[2], net_W.shape[3] #(C,Jx,Jy) C = channels
+        J,K = ID.shape
+        
+        W = net_W.contiguous().view(dim1, dim2 * dim3)
+        W = W.t()  # dim: (J=Jx*Jy, C)
+
+        #  1. Gather neighbor feature vectors:
+        nn_W = W[ID]      #shape: (J, K, C)
+
+        # 2. Expand reference features for voxel j, W[j] to (J, K, C)
+        ref_W = W.unsqueeze(1)                     # shape: (J, 1, C)
+
+        # 3. Compute squared vector differences 
+        diff = ref_W - nn_W                 # shape: (J, K, C)
+        sq_diff = diff ** 2
+
+        #  4. Mean over feature channels C, sqrt, and negate
+        D = -torch.sqrt(torch.mean(sq_diff, dim=2) + self.eps)   # shape: (J, K)
+
+        # 5. Softmax across neighbors
+        Kw = torch.softmax(D, dim=1)
+
+        return Kw, ID
+
+
     def forward(self, input, k,w, functional_input=None):
         ## compute the weight
         # input = input1.to(input1.device)
@@ -431,6 +505,7 @@ class BuildK(nn.Module):
         functional_W = None
         
         clear_pytorch_cache()
+
         if self.save_mem_k and not self.isHybrid :
             W, ID = self.get_knn(input,w,k)
             self.get_K_save_mem(W,ID,self.ksigma)
